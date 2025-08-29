@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>NKN Globe — Full Mesh Signaller (three@0.179.1)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- NKN SDK (global `nkn`) -->
+  <script src="https://unpkg.com/nkn-sdk@1.3.6/dist/nkn.min.js"></script>
+
+  <!-- Import maps polyfill -->
+  <script async src="https://unpkg.com/es-module-shims@1.10.0/dist/es-module-shims.js"></script>
+
+  <!-- Import Map for three 0.179.1 -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.179.1/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.179.1/examples/jsm/"
+    }
+  }
+  </script>
+
+  <style>
+    :root { --bg:#0b0b0b; --fg:#eee; --muted:#9aa0a6; --line:#1b1b1b; --ok:#30cf6b; --warn:#f7b500; --err:#e84d4d; }
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+    .wrap{display:grid;grid-template-columns:360px 1fr 380px;gap:14px;height:100%;padding:14px;max-width:1800px;margin:0 auto}
+    .card{border:1px solid var(--line);border-radius:12px;background:#0f1011;padding:12px}
+    h1{margin:0 0 10px;font-size:18px}
+    label{display:block;font-size:12px;color:var(--muted);margin:8px 0 6px}
+    input{height:36px;width:100%;background:#000;border:1px solid #242424;border-radius:10px;color:var(--fg);padding:8px 10px}
+    .status{display:flex;flex-direction:column;gap:6px}
+    .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+    .dot{width:10px;height:10px;border-radius:50%;background:#444;border:1px solid #222}
+    .ok{background:var(--ok)} .warn{background:var(--warn)} .err{background:var(--err)}
+    .tiny{font-size:12px;color:var(--muted)}
+    .badge{display:inline-flex;align-items:center;gap:6px;border:1px solid #252525;border-radius:999px;padding:2px 8px;font-size:12px;background:#0a0a0a}
+    .sliderRow input[type=range]{width:100%}
+    #scene{position:relative;height:calc(100vh - 28px)}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    #meshLog{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0a0a0a;border:1px solid #222;border-radius:10px;padding:8px;height:calc(100vh - 120px);overflow:auto}
+    #meshLog p{margin:.25rem 0}
+    .tag{display:inline-block;padding:1px 6px;border-radius:999px;border:1px solid #2a2a2a;margin-right:6px;font-size:11px}
+    .tag.probe{color:#f7e6a6} .tag.tx{color:#bfe3ff} .tag.rx{color:#9affc1} .tag.tick{color:#d4bfff}
+    .tag.err{color:#ffb4b4} .tag.info{color:#c9d1d9}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <!-- Controls -->
+    <div class="card" style="display:flex;flex-direction:column;gap:12px">
+      <h1>NKN Globe — Full Mesh Signaller</h1>
+
+      <div class="card">
+        <label>Primary Signaller Public Key (64-hex) — override</label>
+        <input id="hexSig" class="mono" placeholder="64-hex (blank = default)" spellcheck="false" />
+        <div class="tiny">Default: <code class="mono">5a0a81a8e4d6538a81e59d04057611a779f762da49c5eaf79a96badb91788c0c</code></div>
+      </div>
+
+      <div class="card">
+        <div class="status">
+          <div class="row"><span id="dotNkn" class="dot"></span><div id="txtNkn">NKN: connecting…</div></div>
+          <div class="row"><span id="dotSig" class="dot"></span><div id="txtSig">Mesh: discovering…</div></div>
+          <div class="tiny" id="txtSigMeta">—</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row sliderRow">
+          <div class="badge">Resolution</div>
+          <div class="tiny" id="precLabel">0.01° (~1.1 km)</div>
+        </div>
+        <input id="prec" type="range" min="0" max="5" step="1" value="5" />
+        <div class="tiny">10°, 5°, 1°, 0.2°, 0.05°, <strong>0.01°</strong></div>
+      </div>
+
+      <div class="card">
+        <div class="tiny">Your address: <span id="myAddr" class="mono">—</span><br/>Your pubkey: <span id="myPub" class="mono">—</span></div>
+      </div>
+    </div>
+
+    <!-- Globe -->
+    <div class="card" id="scene"></div>
+
+    <!-- Mesh Log -->
+    <div class="card" style="display:flex;flex-direction:column;gap:8px">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <div class="badge">Mesh Log</div>
+        <div class="tiny" id="meshSummary">—</div>
+      </div>
+      <div id="meshLog" aria-live="polite"></div>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // ───────────── Helpers & UI ─────────────
+    const $ = s => document.querySelector(s);
+    const meshLogEl = $('#meshLog');
+    const logLimit = 800;
+    const logMesh = (kind, text) => {
+      const p = document.createElement('p');
+      const tag = document.createElement('span');
+      tag.className = 'tag ' + kind; tag.textContent = kind.toUpperCase();
+      p.appendChild(tag); p.appendChild(document.createTextNode(text));
+      meshLogEl.appendChild(p);
+      while (meshLogEl.children.length > logLimit) meshLogEl.removeChild(meshLogEl.firstChild);
+      meshLogEl.scrollTop = meshLogEl.scrollHeight;
+    };
+    const shortHex = (s,a=6,b=6)=>s?(s.slice(0,a)+'…'+s.slice(-b)):'—';
+    const isHex64 = s => /^[0-9a-f]{64}$/i.test((s||'').trim());
+    const now = ()=>Date.now();
+    const fmtAgo = ms => { if(ms<1500) return 'now'; const s=Math.floor(ms/1000); if(s<60) return s+'s'; const m=Math.floor(s/60); if(m<60) return m+'m'; const h=Math.floor(m/60); if(h<24) return h+'h'; const d=Math.floor(h/24); return d+'d'; };
+    const setNkn=(t,cls)=>{$('#txtNkn').textContent=t;$('#dotNkn').className='dot '+(cls||'');};
+    const setSig=(t,cls)=>{$('#txtSig').textContent=t;$('#dotSig').className='dot '+(cls||'');};
+    const setSigMeta=t=>{$('#txtSigMeta').textContent=t;};
+    const setSummary=t=>{$('#meshSummary').textContent=t;};
+
+    const LS={ SEED:'NKN_SEED_HEX_V1', SIGHEX:'NKN_SIG_HEX', PEERBOOK:'NKN_PEERBOOK_V2', KNOWN_IDS:'NKN_KNOWN_IDS_V2' };
+    const DEFAULT_SIG_HEX='5a0a81a8e4d6538a81e59d04057611a779f762da49c5eaf79a96badb91788c0c';
+
+    // Precision slider
+    const PREC_STEPS=[10,5,1,0.2,0.05,0.01];
+    const updatePrecLabel=()=>{const deg=PREC_STEPS[parseInt($('#prec').value,10)];$('#precLabel').textContent=`${deg}° (~${Math.round(deg*111)} km)`;return deg;};
+    $('#prec').addEventListener('input', updatePrecLabel); updatePrecLabel();
+
+    // Seed
+    const toHex=u8=>Array.from(u8).map(b=>b.toString(16).padStart(2,'0')).join('');
+    function getOrCreateSeed(){let hex=localStorage.getItem(LS.SEED); if(/^[0-9a-f]{64}$/i.test(hex||''))return hex; const u=new Uint8Array(32); crypto.getRandomValues(u); hex=toHex(u); localStorage.setItem(LS.SEED,hex); return hex;}
+
+    // ───────────── Three Scene ─────────────
+    const container=$('#scene'), scene=new THREE.Scene(); scene.background=new THREE.Color(0x0b0b0b);
+    const camera=new THREE.PerspectiveCamera(45,container.clientWidth/container.clientHeight,0.1,1000); camera.position.set(0,1.2,2.1);
+    const renderer=new THREE.WebGLRenderer({antialias:true}); renderer.setPixelRatio(Math.min(devicePixelRatio,2)); renderer.setSize(container.clientWidth,container.clientHeight); container.appendChild(renderer.domElement);
+    const controls=new OrbitControls(camera,renderer.domElement); controls.enableDamping=true; controls.dampingFactor=0.08; controls.minDistance=1.3; controls.maxDistance=6;
+    scene.add(new THREE.AmbientLight(0xffffff,0.9));
+    const R=1.0;
+    const globe=new THREE.Mesh(new THREE.SphereGeometry(R,64,32), new THREE.MeshBasicMaterial({color:0x2a2a2a,wireframe:true})); scene.add(globe);
+    const peerLayer=new THREE.Group(); scene.add(peerLayer);
+
+    const latLonToVec3=(lat,lon,r=R)=>{const phi=(90-lat)*Math.PI/180, theta=(lon+180)*Math.PI/180; const x=-r*Math.sin(phi)*Math.cos(theta), z=r*Math.sin(phi)*Math.sin(theta), y=r*Math.cos(phi); return new THREE.Vector3(x,y,z);};
+    function makeLabelSprite(text,color='#ffffff',opacity=1){const pad=6,fs=20,c=document.createElement('canvas'),ctx=c.getContext('2d');ctx.font=`${fs}px ui-monospace, Menlo, Consolas, monospace`;const w=Math.ceil(ctx.measureText(text).width)+pad*2,h=fs+pad*2;c.width=w;c.height=h;ctx.font=`${fs}px ui-monospace, Menlo, Consolas, monospace`;ctx.fillStyle=`rgba(0,0,0,${0.65*opacity})`;ctx.fillRect(0,0,w,h);ctx.strokeStyle=`rgba(68,68,68,${opacity})`;ctx.strokeRect(0.5,0.5,w-1,h-1);ctx.fillStyle=color;ctx.globalAlpha=opacity;ctx.fillText(text,pad,fs+(pad/2)-2);const tex=new THREE.CanvasTexture(c);const mat=new THREE.SpriteMaterial({map:tex,transparent:true,opacity});const sprite=new THREE.Sprite(mat);const scale=0.35;sprite.scale.set(w/200*scale,h/200*scale,1);sprite.center.set(0.1,0.0);return sprite;}
+    const peers=new Map(); // pub -> {group,dot,label,isSelf,isVestigial,lastTs,addr,lat,lon}
+    function ensurePeer(pub,{isSelf=false,addr=null}={}){let ent=peers.get(pub);if(!ent){const group=new THREE.Group();const dot=new THREE.Mesh(new THREE.SphereGeometry(0.015,16,16), new THREE.MeshBasicMaterial({color:isSelf?0xffffff:0x4db8ff,transparent:true,opacity:1}));group.add(dot);const label=makeLabelSprite(isSelf?'me':(addr?shortHex(addr,6,6):shortHex(pub,6,6)),isSelf?'#ffffff':'#bfe3ff',1);label.position.set(0.03,0.03,0);group.add(label);peerLayer.add(group);ent={group,dot,label,isSelf,isVestigial:false,lastTs:0,addr,lat:null,lon:null};peers.set(pub,ent);}else{if(addr)ent.addr=addr;if(isSelf)ent.isSelf=true;}return ent;}
+    function setLabel(ent,text,color,opacity){if(ent.label){if(ent.label.material&&ent.label.material.map)ent.label.material.map.dispose();if(ent.label.material)ent.label.material.dispose();ent.group.remove(ent.label);}ent.label=makeLabelSprite(text,color,opacity);ent.label.position.set(0.03,0.03,0);ent.group.add(ent.label);}
+    function renderPeer(ent){const t=now();const isStale=ent.isVestigial||(t-(ent.lastTs||0))>90_000;ent.dot.material.opacity=isStale?0.25:1.0;let labelText,labelColor,labelOpacity;if(isStale){const ago=fmtAgo(t-(ent.lastTs||t));labelText=`last seen ${ago}`;labelColor='#d0d0d0';labelOpacity=0.25;}else{const base=ent.isSelf?'me':(ent.addr?shortHex(ent.addr,6,6):'');const age=t-(ent.lastTs||t);const when=age<5000?'now':`${fmtAgo(age)} ago`;labelText=base?`${base} • ${when}`:when;labelColor=ent.isSelf?'#ffffff':'#bfe3ff';labelOpacity=1;}setLabel(ent,labelText,labelColor,labelOpacity);}
+    function updatePeer(pub,lat,lon,{isSelf=false,addr=null,ts=now(),vestigial=null}={}){const ent=ensurePeer(pub,{isSelf,addr});if(ent.lastTs&&ts<ent.lastTs)return;if(typeof lat==='number'&&typeof lon==='number'){ent.group.position.copy(latLonToVec3(lat,lon,R+0.002));ent.lat=lat;ent.lon=lon;}ent.lastTs=ts;if(vestigial!==null)ent.isVestigial=!!vestigial;renderPeer(ent);}
+    function touchPeer(pub, {ts=now(), addr=null}={}){const ent=ensurePeer(pub,{isSelf:false,addr}); ent.lastTs = Math.max(ent.lastTs||0, ts); ent.isVestigial=false; renderPeer(ent);}
+
+    setInterval(()=>{const t=now();for(const [,ent] of peers.entries()){if(!ent.isSelf&&(t-(ent.lastTs||0))>90_000){ent.isVestigial=true;renderPeer(ent);}}},10_000);
+
+    (function tick(){globe.rotation.y+=0.0008;controls.update();renderer.render(scene,camera);requestAnimationFrame(tick);}());
+    addEventListener('resize',()=>{const w=container.clientWidth,h=container.clientHeight;camera.aspect=w/h;camera.updateProjectionMatrix();renderer.setSize(w,h);});
+
+    // ───────────── Mesh Engine ─────────────
+    let client=null,selfPub=null,selfAddr=null;
+    let signallerHex='', signallerPrefix='signal';
+
+    // Known identifiers per pub; candidate generation
+    const knownIdsByPub=new Map(); // pub -> Set(identifiers)
+    function idSet(pub){ let s=knownIdsByPub.get(pub); if(!s){ s=new Set(['peer','web','signal']); knownIdsByPub.set(pub,s);} return s; }
+    const persistKnownIds=()=>{const obj={}; for(const [k,set] of knownIdsByPub.entries()) obj[k]=[...set]; localStorage.setItem(LS.KNOWN_IDS,JSON.stringify(obj));};
+    const loadKnownIds=()=>{try{const txt=localStorage.getItem(LS.KNOWN_IDS); if(!txt) return; const obj=JSON.parse(txt); for(const [k,arr] of Object.entries(obj)) knownIdsByPub.set(k,new Set(arr));}catch{}};
+
+    // Candidate pool (addresses to send to)
+    const addrPool=new Map(); // addr -> {lastSeen,lastAck,rttMs,updates,failures,lastProbe}
+    const poolAdd=(addr,when=now())=>{ if(!addr) return; const m=addrPool.get(addr)||{lastSeen:0,lastAck:0,rttMs:null,updates:0,failures:0,lastProbe:0}; m.lastSeen=Math.max(m.lastSeen,when); addrPool.set(addr,m); updateSigMeta(); };
+    const poolNoteAck=(addr,rtt=null)=>{ const m=addrPool.get(addr)||{lastSeen:0,lastAck:0,rttMs:null,updates:0,failures:0,lastProbe:0}; m.lastAck=now(); if(rtt!=null) m.rttMs=rtt; addrPool.set(addr,m); updateSigMeta(); };
+    const poolNoteUpdate=addr=>{ const m=addrPool.get(addr)||{lastSeen:0,lastAck:0,rttMs:null,updates:0,failures:0,lastProbe:0}; m.updates+=1; m.lastSeen=now(); addrPool.set(addr,m); updateSigMeta(); };
+    const poolNoteTimeout=addr=>{ const m=addrPool.get(addr)||{lastSeen:0,lastAck:0,rttMs:null,updates:0,failures:0,lastProbe:0}; m.failures+=1; addrPool.set(addr,m); updateSigMeta(); };
+
+    // Build targets set (primary + pool + synthesized from peers/ids)
+    function targets(max=200){
+      const set=new Set();
+      if(isHex64(signallerHex)) set.add(`${signallerPrefix}.${signallerHex}`);
+      for(const a of addrPool.keys()) set.add(a);
+      for(const [pub,ent] of peers.entries()){
+        if(ent.addr) set.add(ent.addr);
+        const ids=idSet(pub); ids.forEach(id=>set.add(`${id}.${pub}`));
+      }
+      const out=[]; for(const a of set.values()){ if(a!==selfAddr) out.push(a); if(out.length>=max) break; }
+      return out;
+    }
+
+    // Persist peerbook
+    const persistPeerbook=()=>{const out={}; for(const [pub,ent] of peers.entries()) out[pub]={addr:ent.addr,lastTs:ent.lastTs,lat:ent.lat,lon:ent.lon}; localStorage.setItem(LS.PEERBOOK,JSON.stringify(out));};
+    const loadPeerbook=()=>{try{const txt=localStorage.getItem(LS.PEERBOOK); if(!txt) return; const j=JSON.parse(txt); const t=now(); for(const [pub,v] of Object.entries(j)){ const addr=v.addr||`web.${pub}`; ensurePeer(pub,{isSelf:false,addr}); if(typeof v.lat==='number'&&typeof v.lon==='number'){ updatePeer(pub,v.lat,v.lon,{ts:v.lastTs||(t-300000),vestigial:true,addr}); } idSet(pub); poolAdd(addr,t); idSet(pub).forEach(id=>poolAdd(`${id}.${pub}`,t)); }}catch{}};
+
+    // Loop guard
+    const seenIds=new Map(); // id -> ts
+    setInterval(()=>{const cut=now()-120000; for(const [id,ts] of seenIds.entries()) if(ts<cut) seenIds.delete(id);},15000);
+    function markSeen(msg){const id=(msg&&typeof msg.id==='string')?msg.id:`${msg?.type||'?'}|${msg?.from||'?'}|${msg?.ts||0}`; const t=now(); const prev=seenIds.get(id); if(prev&&(t-prev)<60000) return true; seenIds.set(id,t); return false;}
+
+    // Fire-and-forget send
+    const SEND_OPTS={ noReply:true, maxHoldingSeconds:30 };
+    function sendRaw(to,text){ try{ client.send(to,text,SEND_OPTS).catch(()=>{}); }catch{} }
+    function fanout(text, exclude=null){ for(const to of targets()){ if(to===exclude) continue; sendRaw(to,text); } }
+
+    // Heartbeats, ticks & probes
+    let hbTimer=null, tickTimer=null; const outstanding=new Map(); // id -> {addr,t0}
+    function probeAll(){ if(!client||!client.addr||!selfPub) return;
+      const list=targets(); setSig(`Mesh: probing ${list.length} targets…`,'warn'); setSummary(`${list.length} targets • ${onlineCount()} online`);
+      const t0=now();
+      for(const to of list){
+        const id=`hb|${selfPub}|${t0}|${to}`;
+        outstanding.set(id,{addr:to,t0});
+        addrPool.set(to,{...(addrPool.get(to)||{}), lastProbe:t0});
+        logMesh('probe',`→ ${to}`);
+        sendRaw(to, JSON.stringify({ver:1,type:'hb',id,from:selfPub,t_client:t0,caps:{relay:true,roster:true}}));
+        sendRaw(to, JSON.stringify({ver:1,type:'peers_req',id:`peers_req|${selfPub}|${t0}`,from:selfPub,ts:t0}));
+      }
+    }
+    function scheduleHB(){ if(hbTimer) clearInterval(hbTimer); hbTimer=setInterval(probeAll, 5000); }
+    function scheduleTicks(){ if(tickTimer) clearInterval(tickTimer); tickTimer=setInterval(()=>{
+        const t=now(); for(const [addr,m] of addrPool.entries()){
+          if((t-(m.lastAck||0))<10000){ // considered online → keep the pipe warm
+            const id=`tick|${selfPub}|${t}|${addr}`;
+            logMesh('tick',`↔ ${addr}`);
+            sendRaw(addr, JSON.stringify({ver:1,type:'tick',id,from:selfPub,ts:t}));
+          }
+        }
+      }, 2500);
+    }
+
+    // Roster build + periodic presence push (refresh!)
+    function buildRoster(){
+      const items=[]; for(const [pub,ent] of peers.entries()){
+        const ids=[...idSet(pub)];
+        const it={ pub, ids, addr: ent.addr || (ids[0]?`${ids[0]}.${pub}`:`web.${pub}`), last: ent.lastTs||0, vestigial: !!ent.isVestigial };
+        if(typeof ent.lat==='number'&&typeof ent.lon==='number'){ it.lat=ent.lat; it.lon=ent.lon; }
+        items.push(it);
+      }
+      return { ver:1, type:'peers', id:`peers|${selfPub}|${now()}`, ts:now(), items };
+    }
+    function burstRoster(to){ const msg=JSON.stringify(buildRoster()); sendRaw(to,msg); logMesh('tx',`→ roster to ${to}`); }
+    setInterval(()=>{ // periodic presence refresh to everyone
+      const msg=JSON.stringify(buildRoster());
+      fanout(msg);
+      logMesh('tx','→ roster broadcast');
+    }, 12000);
+
+    // Geolocation (auto)
+    let watchId=null, shareTimer=null, lastQuant=null;
+    const quantize=(lat,lon,deg)=>({lat:Math.round(lat/deg)*deg,lon:Math.round(lon/deg)*deg});
+    function startSharing(){
+      if(!('geolocation' in navigator)||watchId!=null) return;
+      const opts={enableHighAccuracy:false,maximumAge:15000,timeout:15000};
+      watchId=navigator.geolocation.watchPosition(
+        pos=>{
+          const {latitude,longitude}=pos.coords; const deg=updatePrecLabel();
+          lastQuant=quantize(latitude,longitude,deg);
+          if(selfPub) updatePeer(selfPub,lastQuant.lat,lastQuant.lon,{isSelf:true,addr:selfAddr,ts:now(),vestigial:false});
+          if(!shareTimer){
+            shareTimer=setInterval(()=>{
+              if(!client||!client.addr||!selfPub||!lastQuant) return;
+              const d=updatePrecLabel();
+              const pkt={ver:1,type:'loc',id:`loc|${selfPub}|${now()}`,from:selfPub,addr:selfAddr,ts:now(),precision:{deg:d,kmApprox:Math.round(d*111)},loc:{lat:lastQuant.lat,lon:lastQuant.lon},caps:{relay:true,roster:true}};
+              fanout(JSON.stringify(pkt));
+            },5000);
+          }
+        },
+        err=>logMesh('err',`geolocation: ${err.message}`),
+        opts
+      );
+    }
+
+    // Auto-join loop (keep asserting membership)
+    setInterval(()=>{ if(!client||!client.addr||!selfPub) return;
+      const pkt={ver:1,type:'join',id:`join|${selfPub}|${now()}`,from:selfPub,addr:selfAddr,ts:now(),precision:{deg:updatePrecLabel()},loc:lastQuant||null,caps:{relay:true,roster:true}};
+      fanout(JSON.stringify(pkt));
+    },7000);
+
+    // Online stats
+    const onlineCount=()=>{let n=0,t=now(); for(const [,m] of addrPool.entries()) if((t-(m.lastAck||0))<15000) n++; return n;};
+    function updateSigMeta(){
+      let best=null,bRtt=Infinity,bSeen=0;
+      for(const [addr,m] of addrPool.entries()){const r=m.rttMs==null?Infinity:m.rttMs; const s=m.lastSeen||0; if(r<bRtt||(r===bRtt&&s>bSeen)){best=addr; bRtt=r; bSeen=s;}}
+      const live=onlineCount(), total=addrPool.size;
+      const hz=(([...addrPool.values()].reduce((a,m)=>a+m.updates,0)/Math.max(1,total))/30).toFixed(1);
+      if(!best){ setSig('Mesh: discovering…','warn'); setSigMeta(`targets: ${total} • online: ${live} • latency: — • updates: 0.0 Hz`); }
+      else { const lastSeenStr=bSeen?`${fmtAgo(now()-bSeen)} ago`:'—'; const rtt=(bRtt===Infinity)?'—':`${Math.round(bRtt)} ms`; setSig(`Mesh: ${shortHex(best,7,6)} • ${live}/${total} online`,'ok'); setSigMeta(`last seen: ${lastSeenStr} • latency: ${rtt} • updates: ${hz} Hz`); }
+      setSummary(`${total} targets • ${live} online`);
+    }
+
+    // Relay everything (server parity)
+    function relayMessage(src,text,parsed){
+      if(parsed?.from && parsed.from===selfPub) return; // don't reflect self
+      if(parsed && markSeen(parsed)) return;            // de-loop identical frames
+      if(src) poolAdd(src, now());
+      fanout(text, src);
+    }
+
+    // Merge roster & aggressively synthesize + probe
+    function handleRoster(src,msg){
+      poolNoteUpdate(src);
+      const tsNow=now();
+      if(!Array.isArray(msg.items)) return;
+      for(const it of msg.items){
+        const pub=(it.pub||'').toLowerCase(); if(!pub||pub===(selfPub||'').toLowerCase()) continue;
+        const ids=idSet(pub); (Array.isArray(it.ids)?it.ids:[]).forEach(id=>ids.add(id));
+        ids.forEach(id=>poolAdd(`${id}.${pub}`, tsNow));
+        const addrGuess = it.addr || (ids.size ? `${[...ids][0]}.${pub}` : `web.${pub}`);
+        poolAdd(addrGuess, tsNow);
+        ensurePeer(pub,{isSelf:false,addr:addrGuess});
+        const ts = typeof it.last==='number' ? it.last : tsNow;
+        if(typeof it.lat==='number'&&typeof it.lon==='number') updatePeer(pub,it.lat,it.lon,{isSelf:false,addr:addrGuess,ts,vestigial:!!it.vestigial});
+        else touchPeer(pub,{ts,addr:addrGuess});
+      }
+      persistKnownIds(); persistPeerbook();
+      setTimeout(probeAll, 200);
+    }
+
+    // NKN Connect
+    async function connectNkn(){
+      try{
+        setNkn('NKN: connecting…','warn');
+        const seed=getOrCreateSeed();
+        client=new window.nkn.MultiClient({ seed, identifier:'web', numSubClients:8, originalClient:true });
+        client.onConnect(()=>{ selfAddr=client.addr||null; selfPub=client.getPublicKey()||null;
+          $('#myAddr').textContent=selfAddr||'—'; $('#myPub').textContent=selfPub||'—'; setNkn('NKN: connected','ok');
+          startSharing(); scheduleHB(); scheduleTicks();
+          probeAll();
+          for(const to of targets()) sendRaw(to, JSON.stringify({ver:1,type:'peers_req',id:`peers_req|${selfPub}|${now()}`,from:selfPub,ts:now()}));
+        });
+
+        client.onMessage(({src,payload})=>{
+          if(src){ const m=/^([a-z0-9_-]+)\.([0-9a-f]{64})$/i.exec(src); if(m){ const id=m[1], pub=m[2].toLowerCase(); idSet(pub).add(id); persistKnownIds(); poolAdd(src, now()); } }
+
+          let text=payload; if(payload instanceof Uint8Array){ try{text=new TextDecoder().decode(payload);}catch{} }
+          if(typeof text!=='string') return;
+          let msg=null; if(text.trim().startsWith('{')){ try{ msg=JSON.parse(text);}catch{} }
+
+          const tsNow=now();
+
+          if(msg){
+            if(markSeen(msg)) return;
+
+            // Heartbeats / Acks / Tick → presence touch
+            if(msg.type==='hb'){ // reply + touch sender
+              sendRaw(src, JSON.stringify({ver:1,type:'hb_ack',id:msg.id||`hb_ack|${selfPub}|${tsNow}`,from:selfPub,t_client:msg.t_client}));
+              poolNoteUpdate(src);
+              if(msg.from) touchPeer(msg.from.toLowerCase(), {ts: tsNow});
+              return;
+            }
+            if(msg.type==='hb_ack' && typeof msg.t_client==='number'){
+              const rec=outstanding.get(msg.id); const rtt=Math.max(0,tsNow - (rec?rec.t0:msg.t_client));
+              outstanding.delete(msg.id); poolNoteAck(src,rtt); logMesh('rx',`✓ ack ${src} • ${Math.round(rtt)}ms`);
+              if(msg.from) touchPeer(msg.from.toLowerCase(), {ts: tsNow});
+              burstRoster(src); return;
+            }
+            if(msg.type==='tick'){ // touch presence; optional tick_ack not required
+              if(msg.from) touchPeer(msg.from.toLowerCase(), {ts: tsNow});
+              return;
+            }
+
+            // Join / Joined
+            if(msg.type==='join'){
+              sendRaw(src, JSON.stringify({ver:1,type:'joined',id:`joined|${selfPub}|${tsNow}`,ts:tsNow,addr:selfAddr,prefix:'peer'}));
+              burstRoster(src);
+              if(msg.from && msg.loc && typeof msg.loc.lat==='number'&&typeof msg.loc.lon==='number'){
+                const from=msg.from.toLowerCase(); updatePeer(from,msg.loc.lat,msg.loc.lon,{isSelf:false,addr:msg.addr||`web.${from}`,ts:msg.ts||tsNow,vestigial:false}); persistPeerbook();
+              } else if (msg.from) {
+                touchPeer(msg.from.toLowerCase(), {ts: tsNow});
+              }
+              relayMessage(src,text,msg); return;
+            }
+            if(msg.type==='joined'){ poolNoteAck(src,null); return; }
+
+            // Rosters
+            if(msg.type==='peers'){ logMesh('rx',`roster from ${src} • ${Array.isArray(msg.items)?msg.items.length:0} items`); handleRoster(src,msg); return; }
+            if(msg.type==='peers_req'){ burstRoster(src); return; }
+
+            // Live updates
+            if(msg.type==='leave' && msg.from){ const from=msg.from.toLowerCase(); const ent=ensurePeer(from,{isSelf:false,addr:msg.addr||`web.${from}`}); updatePeer(from,ent.lat,ent.lon,{isSelf:false,addr:ent.addr,ts:msg.ts||tsNow,vestigial:true}); persistPeerbook(); relayMessage(src,text,msg); return; }
+            if((msg.type==='loc'||msg.type==='join') && msg.from && msg.loc && typeof msg.loc.lat==='number'&&typeof msg.loc.lon==='number'){
+              const from=msg.from.toLowerCase(); updatePeer(from,msg.loc.lat,msg.loc.lon,{isSelf:false,addr:msg.addr||`web.${from}`,ts:msg.ts||tsNow,vestigial:false}); persistPeerbook(); relayMessage(src,text,msg); return;
+            }
+
+            // Unknown JSON → relay
+            relayMessage(src,text,msg); return;
+          }
+
+          // Non-JSON payload → relay too
+          relayMessage(src,text,null);
+        });
+
+        client.on('error',()=>setNkn('NKN: error','err'));
+        client.on('connectFailed',()=>setNkn('NKN: connect failed (retrying)','warn'));
+        client.on('willreconnect',()=>setNkn('NKN: reconnecting…','warn'));
+        client.on('close',()=>setNkn('NKN: disconnected','err'));
+      }catch{ setNkn('NKN: init failed','err'); }
+    }
+
+    // Signaller override & boot
+    const hexInput=$('#hexSig'); hexInput.value=localStorage.getItem(LS.SIGHEX)||'';
+    function applySignallerHex(raw){ const v=(raw||'').trim().toLowerCase(); signallerHex=isHex64(v)?v:DEFAULT_SIG_HEX; if(isHex64(v)) localStorage.setItem(LS.SIGHEX,v); signallerPrefix='signal';
+      const primary=`${signallerPrefix}.${signallerHex}`; poolAdd(primary,now()); setSig(`Mesh: prim ${shortHex(primary,7,6)} + peers`,'warn'); setSigMeta('probing candidates…'); probeAll();
+    }
+    hexInput.addEventListener('input',()=>applySignallerHex(hexInput.value)); applySignallerHex(hexInput.value||DEFAULT_SIG_HEX);
+
+    // Restore caches and seed pool aggressively
+    loadKnownIds();
+    loadPeerbook();
+
+    // Start
+    connectNkn();
+
+    // Leave notice
+    addEventListener('beforeunload',()=>{ try{ const pkt={ver:1,type:'leave',id:`leave|${selfPub}|${now()}`,from:selfPub,addr:selfAddr,ts:now()}; fanout(JSON.stringify(pkt)); }catch{} });
+
+    // Timeouts sweep
+    setInterval(()=>{ const t=now(); for(const [id,rec] of [...outstanding.entries()]){ if(t-rec.t0>8000){ outstanding.delete(id); poolNoteTimeout(rec.addr); logMesh('err',`× timeout ${rec.addr}`); } }},1000);
+  </script>
+</body>
+</html>
